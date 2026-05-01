@@ -1,0 +1,792 @@
+/**
+ * ╔══════════════════════════════════════════════════════════╗
+ * ║              JHEventBus — v3.0.0                        ║
+ * ║       Production-Grade Pub/Sub Event Bus                ║
+ * ╠══════════════════════════════════════════════════════════╣
+ * ║  Core Features                                          ║
+ * ║  ─────────────────────────────────────────────────────  ║
+ * ║  • on / off / once / emit                               ║
+ * ║  • Priority-based listener sorting                      ║
+ * ║  • Wildcard "*" listeners                               ║
+ * ║  • Async & sync handler support                         ║
+ * ║  • Middleware pipeline (per-middleware error isolation)  ║
+ * ║  • Duplicate listener prevention                        ║
+ * ║  • once() removable via off() (WeakMap-based)           ║
+ * ║  • emit() always returns a Promise                      ║
+ * ║  • listenerCount / eventNames / hasListeners            ║
+ * ║  • Universal: Browser + Node.js + SSR                   ║
+ * ║                                                         ║
+ * ║  Debounce (v3 — fully upgraded)                         ║
+ * ║  ─────────────────────────────────────────────────────  ║
+ * ║  • leading  — fire on first call before delay           ║
+ * ║  • trailing — fire after silence (default: true)        ║
+ * ║  • maxWait  — force fire if silent wait exceeds limit   ║
+ * ║  • Returns { off, flush, cancel }                       ║
+ * ║                                                         ║
+ * ║  Throttle (v3 — fully upgraded)                         ║
+ * ║  ─────────────────────────────────────────────────────  ║
+ * ║  • leading  — fire on first call (default: true)        ║
+ * ║  • trailing — fire last call after window (default:true)║
+ * ║  • Returns { off, flush, cancel }                       ║
+ * ╚══════════════════════════════════════════════════════════╝
+ */
+
+class JHEventBus {
+
+  // ════════════════════════════════════════════════════════
+  // CONSTRUCTOR
+  // ════════════════════════════════════════════════════════
+
+  /**
+   * @param {Object}  [options]
+   * @param {number}  [options.maxListeners=100] - Warn when a single event
+   *                                               exceeds this listener count.
+   * @param {boolean} [options.verbose=false]    - Log duplicate-registration
+   *                                               warnings.
+   */
+  constructor(options = {}) {
+
+    /**
+     * Stores all registered listeners grouped by event name.
+     * Shape: { [eventName]: Array<{ handler, priority, type }> }
+     * @type {Record<string, Array<{handler: Function, priority: number, type: string}>>}
+     */
+    this._listeners = {};
+
+    /**
+     * Middleware functions run before every handler on every emit.
+     * @type {Function[]}
+     */
+    this._middlewares = [];
+
+    /**
+     * Maximum listeners per event before a memory-leak warning is printed.
+     * @type {number}
+     */
+    this._maxListeners = options.maxListeners ?? 100;
+
+    /**
+     * When true, duplicate-registration attempts print a console warning.
+     * @type {boolean}
+     */
+    this._verbose = options.verbose ?? false;
+
+    /**
+     * Maps the original handler (passed to once()) to the internal wrapper
+     * function that was actually registered.  This lets off(originalFn) work
+     * correctly even for once() subscriptions.
+     * @type {WeakMap<Function, Function>}
+     */
+    this._onceWrappers = new WeakMap();
+  }
+
+
+  // ════════════════════════════════════════════════════════
+  // PRIVATE — VALIDATION
+  // ════════════════════════════════════════════════════════
+
+  /**
+   * Throws a TypeError when `event` is not a non-empty string.
+   * Called by every public method that accepts an event name.
+   * @param {*} event
+   */
+  _validateEvent(event) {
+    if (typeof event !== "string" || event.trim() === "") {
+      throw new TypeError(
+        `[JHEventBus] Event name must be a non-empty string. ` +
+        `Received: ${JSON.stringify(event)}`
+      );
+    }
+  }
+
+  /**
+   * Throws a TypeError when `handler` is not a function.
+   * Called by every public method that accepts a handler.
+   * @param {*} handler
+   */
+  _validateHandler(handler) {
+    if (typeof handler !== "function") {
+      throw new TypeError(
+        `[JHEventBus] Handler must be a function. ` +
+        `Received: ${typeof handler}`
+      );
+    }
+  }
+
+
+  // ════════════════════════════════════════════════════════
+  // PRIVATE — PIPELINE EXECUTION
+  // ════════════════════════════════════════════════════════
+
+  /**
+   * Runs every registered middleware for a given event + data pair.
+   *
+   * Design decisions:
+   *  - Each middleware is wrapped in its own try/catch so a single bad
+   *    middleware cannot abort the rest of the pipeline.
+   *  - async middlewares are properly awaited.
+   *
+   * @param {string} event
+   * @param {*}      data
+   */
+  async _runMiddlewares(event, data) {
+    for (const mw of this._middlewares) {
+      try {
+        await mw(event, data);
+      } catch (err) {
+        console.error(`[JHEventBus] Middleware error on "${event}":`, err);
+      }
+    }
+  }
+
+  /**
+   * Executes a snapshot list of listener entries sequentially.
+   *
+   * Design decisions:
+   *  - Middlewares run once per listener (not once per emit) so each
+   *    handler gets the full pipeline context.
+   *  - Each listener is isolated in its own try/catch; one failure
+   *    does not prevent subsequent listeners from running.
+   *  - "sync" handlers that accidentally return a Promise are still
+   *    awaited, preventing silent floating-Promise bugs.
+   *
+   * @param {Array<{handler: Function, type: string}>} items
+   * @param {string} event
+   * @param {*}      data
+   */
+  async _runListeners(items, event, data) {
+    for (const item of items) {
+      try {
+        await this._runMiddlewares(event, data);
+
+        if (item.type === "async") {
+          await item.handler(data, event);
+        } else {
+          const result = item.handler(data, event);
+          // Safety net: if a "sync" handler happens to return a Promise, await it
+          if (result instanceof Promise) await result;
+        }
+      } catch (err) {
+        console.error(`[JHEventBus] Error in listener for "${event}":`, err);
+      }
+    }
+  }
+
+
+  // ════════════════════════════════════════════════════════
+  // MIDDLEWARE
+  // ════════════════════════════════════════════════════════
+
+  /**
+   * Registers a middleware function that runs before every handler
+   * on every emit.  Useful for logging, auth guards, tracing, etc.
+   *
+   * fn signature: (event: string, data: any) => void | Promise<void>
+   *
+   * @param  {Function} fn
+   * @returns {this}    — chainable
+   *
+   * @example
+   * bus.use((event, data) => console.log(`[LOG] ${event}`, data));
+   */
+  use(fn) {
+    this._validateHandler(fn);
+    this._middlewares.push(fn);
+    return this;
+  }
+
+
+  // ════════════════════════════════════════════════════════
+  // ON — Subscribe
+  // ════════════════════════════════════════════════════════
+
+  /**
+   * Subscribes `handler` to `event`.
+   *
+   * Options:
+   *  - priority {number}          — Higher number = runs first.  Default: 0.
+   *  - type     {"sync"|"async"}  — "async" awaits the handler.  Default: "sync".
+   *
+   * Behaviour:
+   *  - Registering the same handler twice for the same event is silently
+   *    skipped (with an optional verbose warning) to prevent double-firing.
+   *  - Listeners are sorted by descending priority after every registration.
+   *
+   * @param  {string}   event
+   * @param  {Function} handler
+   * @param  {Object}   [options]
+   * @param  {number}   [options.priority=0]
+   * @param  {"sync"|"async"} [options.type="sync"]
+   * @returns {this}
+   */
+  on(event, handler, options = {}) {
+    this._validateEvent(event);
+    this._validateHandler(handler);
+
+    if (!this._listeners[event]) {
+      this._listeners[event] = [];
+    }
+
+    // ── Duplicate guard ──────────────────────────────────
+    const alreadyRegistered = this._listeners[event].some(
+      (l) => l.handler === handler
+    );
+    if (alreadyRegistered) {
+      if (this._verbose) {
+        console.warn(
+          `[JHEventBus] Handler already registered for "${event}". Skipping duplicate.`
+        );
+      }
+      return this;
+    }
+
+    // ── Memory-leak warning ──────────────────────────────
+    if (this._listeners[event].length >= this._maxListeners) {
+      console.warn(
+        `[JHEventBus] Max listeners (${this._maxListeners}) reached for "${event}". ` +
+        `Possible memory leak detected. Increase maxListeners if intentional.`
+      );
+    }
+
+    this._listeners[event].push({
+      handler,
+      priority : typeof options.priority === "number" ? options.priority : 0,
+      type     : options.type === "async" ? "async" : "sync",
+    });
+
+    // Descending sort: higher priority number runs first
+    this._listeners[event].sort((a, b) => b.priority - a.priority);
+
+    return this;
+  }
+
+
+  // ════════════════════════════════════════════════════════
+  // OFF — Unsubscribe
+  // ════════════════════════════════════════════════════════
+
+  /**
+   * Removes `handler` from `event`.
+   *
+   * Works correctly for handlers registered via once() — pass the
+   * original function and the internal wrapper is resolved automatically
+   * via the WeakMap.
+   *
+   * Automatically deletes the event key when the last listener is removed
+   * to keep _listeners clean and avoid stale keys piling up.
+   *
+   * @param  {string}   event
+   * @param  {Function} handler  — The same reference passed to on() / once()
+   * @returns {this}
+   */
+  off(event, handler) {
+    this._validateEvent(event);
+    this._validateHandler(handler);
+
+    if (!this._listeners[event]) return this;
+
+    // If this was a once() registration, resolve the internal wrapper
+    const target = this._onceWrappers.get(handler) ?? handler;
+
+    this._listeners[event] = this._listeners[event].filter(
+      (l) => l.handler !== target
+    );
+
+    // Clean up the WeakMap entry to allow GC of the wrapper function
+    if (this._onceWrappers.has(handler)) {
+      this._onceWrappers.delete(handler);
+    }
+
+    // Remove the event key entirely when no listeners remain
+    if (this._listeners[event].length === 0) {
+      delete this._listeners[event];
+    }
+
+    return this;
+  }
+
+
+  // ════════════════════════════════════════════════════════
+  // ONCE — Single-fire subscription
+  // ════════════════════════════════════════════════════════
+
+  /**
+   * Subscribes `handler` to `event` for exactly one invocation.
+   * After the first emit the handler is automatically removed.
+   *
+   * The original handler reference can still be passed to off() to
+   * cancel before the first fire.
+   *
+   * Implementation note: we call off() BEFORE invoking the handler
+   * to prevent re-entrancy issues (e.g. if the handler synchronously
+   * emits the same event again).
+   *
+   * @param  {string}   event
+   * @param  {Function} handler
+   * @param  {Object}   [options]  — same as on()
+   * @returns {this}
+   */
+  once(event, handler, options = {}) {
+    this._validateEvent(event);
+    this._validateHandler(handler);
+
+    const wrapper = async (data, evt) => {
+      // Remove first — safe against re-entrant emits of the same event
+      this.off(event, handler);
+      await handler(data, evt);
+    };
+
+    // Store original → wrapper mapping so off(original) resolves correctly
+    this._onceWrappers.set(handler, wrapper);
+
+    return this.on(event, wrapper, options);
+  }
+
+
+  // ════════════════════════════════════════════════════════
+  // EMIT — Publish
+  // ════════════════════════════════════════════════════════
+
+  /**
+   * Fires all listeners registered for `event`, then all wildcard ("*")
+   * listeners.  Always returns a Promise regardless of mode.
+   *
+   * Modes:
+   *  - "parallel" (default) — both event listeners and wildcards run
+   *    concurrently via Promise.all.  Fastest; order between groups
+   *    is not guaranteed.
+   *  - "sync" — event listeners run sequentially first, then wildcards
+   *    sequentially.  Use when ordering matters (e.g. validate then charge).
+   *
+   * Implementation note: listeners are snapshotted at call time so that
+   * handlers which add/remove listeners mid-emit don't affect the current run.
+   *
+   * @param  {string}  event
+   * @param  {*}       [data]
+   * @param  {Object}  [options]
+   * @param  {"sync"|"parallel"} [options.mode="parallel"]
+   * @returns {Promise<this>}
+   */
+  async emit(event, data, options = {}) {
+    this._validateEvent(event);
+
+    // Snapshot listeners so mid-emit mutations don't affect this run
+    const list = [...(this._listeners[event] ?? [])];
+    const wild = [...(this._listeners["*"]    ?? [])];
+
+    if (options.mode === "sync") {
+      // Sequential: event-specific listeners first, wildcards after
+      await this._runListeners(list, event, data);
+      await this._runListeners(wild, event, data);
+    } else {
+      // Parallel: both groups fire concurrently, still fully awaited
+      await Promise.all([
+        this._runListeners(list, event, data),
+        this._runListeners(wild, event, data),
+      ]);
+    }
+
+    return this;
+  }
+
+
+  // ════════════════════════════════════════════════════════
+  // DEBOUNCE  (v3 — fully upgraded)
+  // ════════════════════════════════════════════════════════
+
+  /**
+   * Registers a debounced handler for `event`.
+   *
+   * A debounced handler fires only after `delay` ms of inactivity.
+   * Ideal for: search inputs, window-resize callbacks, form auto-save.
+   *
+   * ┌─────────────────────────────────────────────────────────┐
+   * │  OPTIONS                                                │
+   * ├──────────┬──────────┬──────────────────────────────────┤
+   * │ leading  │ false    │ Fire immediately on the FIRST    │
+   * │          │ (default)│ call before the delay starts.    │
+   * ├──────────┼──────────┼──────────────────────────────────┤
+   * │ trailing │ true     │ Fire after `delay` ms of silence.│
+   * │          │ (default)│ Set false only if leading=true.  │
+   * ├──────────┼──────────┼──────────────────────────────────┤
+   * │ maxWait  │ null     │ Maximum ms to wait regardless of │
+   * │          │ (default)│ how often the event keeps firing.│
+   * │          │          │ Prevents never-firing under      │
+   * │          │          │ constant input. null = no limit. │
+   * └──────────┴──────────┴──────────────────────────────────┘
+   *
+   * ┌─────────────────────────────────────────────────────────┐
+   * │  RETURNS  { off, flush, cancel }                        │
+   * ├─────────┬───────────────────────────────────────────────┤
+   * │ off()   │ Remove the listener entirely.                 │
+   * ├─────────┼───────────────────────────────────────────────┤
+   * │ flush() │ Immediately fire any pending trailing call.   │
+   * │         │ Clears the timer.  No-op if nothing pending.  │
+   * ├─────────┼───────────────────────────────────────────────┤
+   * │ cancel()│ Cancel a pending trailing call without firing.│
+   * │         │ Clears both the trailing and maxWait timers.  │
+   * └─────────┴───────────────────────────────────────────────┘
+   *
+   * @param  {string}   event
+   * @param  {Function} handler
+   * @param  {number}   [delay=300]
+   * @param  {Object}   [options]
+   * @param  {boolean}  [options.leading=false]
+   * @param  {boolean}  [options.trailing=true]
+   * @param  {number|null} [options.maxWait=null]
+   * @returns {{ off: Function, flush: Function, cancel: Function }}
+   *
+   * @example — Search input (only fire after user stops typing for 400ms)
+   *   const ctrl = bus.debounce("search", fetchResults, 400);
+   *   // ...later, on component unmount:
+   *   ctrl.off();
+   *
+   * @example — Leading edge (fire immediately, then ignore for 300ms)
+   *   bus.debounce("btn:click", handler, 300, { leading: true, trailing: false });
+   *
+   * @example — maxWait (fire at least every 1s even under constant input)
+   *   bus.debounce("analytics:track", log, 300, { maxWait: 1000 });
+   */
+  debounce(event, handler, delay = 300, options = {}) {
+    this._validateEvent(event);
+    this._validateHandler(handler);
+
+    const leading  = options.leading  ?? false;
+    const trailing = options.trailing ?? true;
+    const maxWait  = typeof options.maxWait === "number" && options.maxWait > 0
+      ? options.maxWait
+      : null;
+
+    // ── State ────────────────────────────────────────────────
+    let trailingTimer  = null;    // The main silence-window timer
+    let maxWaitTimer   = null;    // The hard-deadline timer (maxWait)
+    let pendingData    = undefined; // Most recent data, held for trailing fire
+    let hasPending     = false;   // True when a trailing call is queued
+    let leadingFired   = false;   // Prevents double-firing on leading+trailing
+
+    // ── Core fire helper ─────────────────────────────────────
+    const fire = (data) => {
+      hasPending   = false;
+      leadingFired = false;
+      handler(data);
+    };
+
+    // ── Cancel both timers without firing ────────────────────
+    const cancelTimers = () => {
+      clearTimeout(trailingTimer);
+      clearTimeout(maxWaitTimer);
+      trailingTimer = null;
+      maxWaitTimer  = null;
+    };
+
+    // ── The wrapper registered with on() ─────────────────────
+    const wrapper = (data) => {
+      pendingData = data;
+      hasPending  = true;
+
+      // ── Leading edge ──────────────────────────────────────
+      // Fire immediately on the first call of a burst.
+      // leadingFired prevents a second leading fire on rapid calls.
+      if (leading && !leadingFired) {
+        leadingFired = true;
+        fire(data);
+      }
+
+      // ── Reset the trailing silence-window timer ───────────
+      // Every new event resets the delay clock.
+      clearTimeout(trailingTimer);
+      if (trailing) {
+        trailingTimer = setTimeout(() => {
+          cancelTimers(); // also clears maxWait since we're resolving now
+          // Don't double-fire if leading already fired this same call
+          if (hasPending && !(leading && leadingFired)) {
+            fire(pendingData);
+          } else {
+            hasPending   = false;
+            leadingFired = false;
+          }
+        }, delay);
+      }
+
+      // ── maxWait: hard-deadline timer ──────────────────────
+      // Start only once per burst (first call, when maxWaitTimer is null).
+      // Forces a fire if the delay keeps resetting past the maxWait limit.
+      if (maxWait !== null && maxWaitTimer === null) {
+        maxWaitTimer = setTimeout(() => {
+          cancelTimers();
+          if (hasPending) fire(pendingData);
+        }, maxWait);
+      }
+    };
+
+    this.on(event, wrapper);
+
+    // ── Returned control object ──────────────────────────────
+    return {
+      /** Removes the debounced listener and clears all pending timers. */
+      off: () => {
+        cancelTimers();
+        this.off(event, wrapper);
+      },
+
+      /**
+       * Immediately fires the pending trailing call (if any) and clears
+       * all timers.  Useful on form submit — flush any buffered input now.
+       */
+      flush: () => {
+        if (hasPending) {
+          cancelTimers();
+          fire(pendingData);
+        }
+      },
+
+      /**
+       * Cancels the pending trailing call without firing it.
+       * The listener stays registered; future emits work normally.
+       */
+      cancel: () => {
+        cancelTimers();
+        hasPending   = false;
+        leadingFired = false;
+      },
+    };
+  }
+
+
+  // ════════════════════════════════════════════════════════
+  // THROTTLE  (v3 — fully upgraded)
+  // ════════════════════════════════════════════════════════
+
+  /**
+   * Registers a throttled handler for `event`.
+   *
+   * A throttled handler fires at most once per `limit` ms window.
+   * Ideal for: scroll listeners, mouse-move tracking, resize handlers,
+   * real-time analytics pings.
+   *
+   * ┌─────────────────────────────────────────────────────────┐
+   * │  OPTIONS                                                │
+   * ├──────────┬──────────┬──────────────────────────────────┤
+   * │ leading  │ true     │ Fire on the FIRST call in a      │
+   * │          │ (default)│ window. Set false to skip it.    │
+   * ├──────────┼──────────┼──────────────────────────────────┤
+   * │ trailing │ true     │ Fire the LAST call that arrived  │
+   * │          │ (default)│ during the window, once it       │
+   * │          │          │ closes. (v2 silently dropped     │
+   * │          │          │ this — now fixed.)               │
+   * └──────────┴──────────┴──────────────────────────────────┘
+   *
+   * Combination guide:
+   *  leading=true  + trailing=true  → fire first + fire last  (default, most useful)
+   *  leading=true  + trailing=false → fire first only, discard rest of window
+   *  leading=false + trailing=true  → fire only at the end of each window
+   *  leading=false + trailing=false → nothing ever fires — don't use this
+   *
+   * ┌─────────────────────────────────────────────────────────┐
+   * │  RETURNS  { off, flush, cancel }                        │
+   * ├─────────┬───────────────────────────────────────────────┤
+   * │ off()   │ Remove the listener entirely.                 │
+   * ├─────────┼───────────────────────────────────────────────┤
+   * │ flush() │ Immediately fire pending trailing call and    │
+   * │         │ reset the throttle window.                    │
+   * ├─────────┼───────────────────────────────────────────────┤
+   * │ cancel()│ Cancel the pending trailing call without      │
+   * │         │ firing. Resets the throttle window.           │
+   * └─────────┴───────────────────────────────────────────────┘
+   *
+   * @param  {string}   event
+   * @param  {Function} handler
+   * @param  {number}   [limit=300]
+   * @param  {Object}   [options]
+   * @param  {boolean}  [options.leading=true]
+   * @param  {boolean}  [options.trailing=true]
+   * @returns {{ off: Function, flush: Function, cancel: Function }}
+   *
+   * @example — Scroll tracking (fire at most once per 200ms)
+   *   const ctrl = bus.throttle("window:scroll", onScroll, 200);
+   *   // Cleanup on unmount:
+   *   ctrl.off();
+   *
+   * @example — Analytics (leading only — discard bursts within 1s)
+   *   bus.throttle("btn:click", logClick, 1000, { trailing: false });
+   *
+   * @example — Trailing only (fire at end of each window, not start)
+   *   bus.throttle("live:price", updateChart, 500, { leading: false });
+   */
+  throttle(event, handler, limit = 300, options = {}) {
+    this._validateEvent(event);
+    this._validateHandler(handler);
+
+    const leading  = options.leading  ?? true;
+    const trailing = options.trailing ?? true;
+
+    // ── State ────────────────────────────────────────────────
+    let windowTimer  = null;      // Closes the current throttle window
+    let lastCallTime = 0;         // Timestamp of the last leading fire
+    let pendingData  = undefined; // Most recent data buffered for trailing
+    let hasPending   = false;     // True when a trailing call is queued
+
+    // ── Core fire helper ─────────────────────────────────────
+    const fire = (data) => {
+      lastCallTime = Date.now();
+      hasPending   = false;
+      handler(data);
+    };
+
+    // ── Start the window-close timer ─────────────────────────
+    // When the window closes, fire the buffered trailing call if any.
+    const startWindow = () => {
+      windowTimer = setTimeout(() => {
+        windowTimer  = null;
+        lastCallTime = 0; // Reset so the next call opens a fresh window
+
+        if (trailing && hasPending) {
+          fire(pendingData);
+        }
+      }, limit);
+    };
+
+    // ── The wrapper registered with on() ─────────────────────
+    const wrapper = (data) => {
+      pendingData = data; // Always buffer — needed for trailing fire
+
+      if (!windowTimer) {
+        // ── No active window → this is the first call of a burst ──
+        if (leading) {
+          fire(data);        // Fire immediately on the leading edge
+          hasPending = false;
+        } else {
+          hasPending = true; // Skip leading; queue for trailing instead
+        }
+        startWindow();
+
+      } else {
+        // ── Inside an active window → buffer for trailing ──────────
+        hasPending = true;
+      }
+    };
+
+    this.on(event, wrapper);
+
+    // ── Returned control object ──────────────────────────────
+    return {
+      /** Removes the throttled listener and clears the window timer. */
+      off: () => {
+        clearTimeout(windowTimer);
+        windowTimer = null;
+        this.off(event, wrapper);
+      },
+
+      /**
+       * Immediately fires the buffered trailing call (if any), then
+       * resets the throttle window so the next event starts fresh.
+       */
+      flush: () => {
+        clearTimeout(windowTimer);
+        windowTimer  = null;
+        lastCallTime = 0;
+        if (hasPending) fire(pendingData);
+      },
+
+      /**
+       * Discards the buffered trailing call without firing it.
+       * Resets the throttle window — the next event starts fresh.
+       */
+      cancel: () => {
+        clearTimeout(windowTimer);
+        windowTimer  = null;
+        lastCallTime = 0;
+        hasPending   = false;
+        pendingData  = undefined;
+      },
+    };
+  }
+
+
+  // ════════════════════════════════════════════════════════
+  // INSPECTION / DEBUG
+  // ════════════════════════════════════════════════════════
+
+  /**
+   * Returns the number of listeners registered for `event`.
+   * Useful for debugging and memory-leak audits.
+   *
+   * @param  {string} event
+   * @returns {number}
+   */
+  listenerCount(event) {
+    this._validateEvent(event);
+    return this._listeners[event]?.length ?? 0;
+  }
+
+  /**
+   * Returns an array of all event names that currently have at least
+   * one listener.
+   *
+   * @returns {string[]}
+   */
+  eventNames() {
+    return Object.keys(this._listeners);
+  }
+
+  /**
+   * Returns true when at least one listener is registered for `event`.
+   *
+   * @param  {string} event
+   * @returns {boolean}
+   */
+  hasListeners(event) {
+    this._validateEvent(event);
+    return (this._listeners[event]?.length ?? 0) > 0;
+  }
+
+
+  // ════════════════════════════════════════════════════════
+  // CLEAR / DESTROY
+  // ════════════════════════════════════════════════════════
+
+  /**
+   * Removes listeners for a specific event, or clears ALL events.
+   *
+   * @param  {string} [event] — Omit to clear everything.
+   * @returns {this}
+   */
+  clear(event) {
+    if (event !== undefined) {
+      this._validateEvent(event);
+      delete this._listeners[event];
+    } else {
+      this._listeners = {};
+    }
+    return this;
+  }
+
+  /**
+   * Full teardown: removes all listeners AND all middlewares.
+   * Call when the bus instance is no longer needed (e.g. app shutdown,
+   * test teardown) to prevent memory leaks.
+   */
+  destroy() {
+    this._listeners   = {};
+    this._middlewares = [];
+  }
+}
+
+
+// ════════════════════════════════════════════════════════
+// UNIVERSAL EXPORT
+// Works in Browser (window), Node.js (global), and
+// CommonJS (require). Importable as an ES module too.
+// ════════════════════════════════════════════════════════
+
+const _instance = new JHEventBus();
+
+if (typeof window !== "undefined") {
+  window.JHbus = _instance;                              // Browser global
+} else if (typeof global !== "undefined") {
+  global.JHbus = _instance;                              // Node.js global
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { JHEventBus, JHbus: _instance };    // CommonJS
+}
