@@ -1,0 +1,678 @@
+// JHEventBus v3.0.0 — Production-Grade Pub/Sub Event Bus
+
+class JHEventBus {
+
+  // ─── Constructor ────────────────────────────────────────
+
+  /**
+   * @param {Object}  [options]
+   * @param {number}  [options.maxListeners=100]
+   * @param {boolean} [options.verbose=false]
+   */
+  constructor(options = {}) {
+    this._listeners    = {};
+    this._middlewares  = [];
+    this._maxListeners = options.maxListeners ?? 100;
+    this._verbose      = options.verbose ?? false;
+    this._onceWrappers = new WeakMap(); // original handler → once() wrapper
+  }
+
+
+  // ─── Private ────────────────────────────────────────────
+
+  _validateEvent(event) {
+    if (typeof event !== "string" || event.trim() === "") {
+      throw new TypeError(
+        `[JHEventBus] Event must be a non-empty string. Received: ${JSON.stringify(event)}`
+      );
+    }
+  }
+
+  _validateHandler(handler) {
+    if (typeof handler !== "function") {
+      throw new TypeError(
+        `[JHEventBus] Handler must be a function. Received: ${typeof handler}`
+      );
+    }
+  }
+
+  async _runMiddlewares(event, data) {
+    for (const mw of this._middlewares) {
+      try {
+        await mw(event, data);
+      } catch (err) {
+        console.error(`[JHEventBus] Middleware error on "${event}":`, err);
+      }
+    }
+  }
+
+  async _runListeners(items, event, data) {
+    for (const item of items) {
+      try {
+        await this._runMiddlewares(event, data);
+        if (item.type === "async") {
+          await item.handler(data, event);
+        } else {
+          const result = item.handler(data, event);
+          if (result instanceof Promise) await result;
+        }
+      } catch (err) {
+        console.error(`[JHEventBus] Listener error on "${event}":`, err);
+      }
+    }
+  }
+
+
+  // ─── Middleware ──────────────────────────────────────────
+
+  /**
+   * Register a middleware that runs before every handler on every emit.
+   * @param {Function} fn  (event, data) => void | Promise<void>
+   * @returns {this}
+   */
+  use(fn) {
+    this._validateHandler(fn);
+    this._middlewares.push(fn);
+    return this;
+  }
+
+
+  // ─── on ─────────────────────────────────────────────────
+
+  /**
+   * Subscribe to an event.
+   * @param {string}   event
+   * @param {Function} handler                (data, event) => void
+   * @param {Object}   [options]
+   * @param {number}   [options.priority=0]   Higher = runs first
+   * @param {"sync"|"async"} [options.type="sync"]
+   * @returns {this}
+   */
+  on(event, handler, options = {}) {
+    this._validateEvent(event);
+    this._validateHandler(handler);
+
+    if (!this._listeners[event]) this._listeners[event] = [];
+
+    const alreadyRegistered = this._listeners[event].some(l => l.handler === handler);
+    if (alreadyRegistered) {
+      if (this._verbose) console.warn(`[JHEventBus] Duplicate handler for "${event}". Skipped.`);
+      return this;
+    }
+
+    if (this._listeners[event].length >= this._maxListeners) {
+      console.warn(`[JHEventBus] Max listeners (${this._maxListeners}) reached for "${event}".`);
+    }
+
+    this._listeners[event].push({
+      handler,
+      priority : typeof options.priority === "number" ? options.priority : 0,
+      type     : options.type === "async" ? "async" : "sync",
+    });
+
+    this._listeners[event].sort((a, b) => b.priority - a.priority);
+    return this;
+  }
+
+
+  // ─── off ────────────────────────────────────────────────
+
+  /**
+   * Unsubscribe a handler. Works for once() registrations too.
+   * @param {string}   event
+   * @param {Function} handler
+   * @returns {this}
+   */
+  off(event, handler) {
+    this._validateEvent(event);
+    this._validateHandler(handler);
+
+    if (!this._listeners[event]) return this;
+
+    const target = this._onceWrappers.get(handler) ?? handler;
+    this._listeners[event] = this._listeners[event].filter(l => l.handler !== target);
+
+    if (this._onceWrappers.has(handler)) this._onceWrappers.delete(handler);
+    if (this._listeners[event].length === 0) delete this._listeners[event];
+
+    return this;
+  }
+
+
+  // ─── once ───────────────────────────────────────────────
+
+  /**
+   * Subscribe for one invocation only. Auto-removes after first fire.
+   * The original handler can still be passed to off() to cancel early.
+   * @param {string}   event
+   * @param {Function} handler
+   * @param {Object}   [options]
+   * @returns {this}
+   */
+  once(event, handler, options = {}) {
+    this._validateEvent(event);
+    this._validateHandler(handler);
+
+    const wrapper = async (data, evt) => {
+      this.off(event, handler); // remove before calling to prevent re-entrancy
+      await handler(data, evt);
+    };
+
+    this._onceWrappers.set(handler, wrapper);
+    return this.on(event, wrapper, options);
+  }
+
+
+  // ─── emit ───────────────────────────────────────────────
+
+  /**
+   * Fire all listeners for an event, then all "*" wildcard listeners.
+   * @param {string}  event
+   * @param {*}       [data]
+   * @param {Object}  [options]
+   * @param {"sync"|"parallel"} [options.mode="parallel"]
+   * @returns {Promise<this>}
+   */
+  async emit(event, data, options = {}) {
+    this._validateEvent(event);
+
+    const list = [...(this._listeners[event] ?? [])];
+    const wild = [...(this._listeners["*"]    ?? [])];
+
+    if (options.mode === "sync") {
+      await this._runListeners(list, event, data);
+      await this._runListeners(wild, event, data);
+    } else {
+      await Promise.all([
+        this._runListeners(list, event, data),
+        this._runListeners(wild, event, data),
+      ]);
+    }
+
+    return this;
+  }
+
+
+  // ─── debounce ───────────────────────────────────────────
+
+  /**
+   * Register a debounced handler — fires after `delay` ms of inactivity.
+   *
+   * @param {string}   event
+   * @param {Function} handler
+   * @param {number}   [delay=300]
+   * @param {Object}   [options]
+   * @param {boolean}  [options.leading=false]   Fire on first call immediately
+   * @param {boolean}  [options.trailing=true]   Fire after silence window
+   * @param {number}   [options.maxWait=null]    Force fire if burst exceeds this ms
+   * @returns {{ off: Function, flush: Function, cancel: Function }}
+   */
+  debounce(event, handler, delay = 300, options = {}) {
+    this._validateEvent(event);
+    this._validateHandler(handler);
+
+    const leading  = options.leading  ?? false;
+    const trailing = options.trailing ?? true;
+    const maxWait  = typeof options.maxWait === "number" && options.maxWait > 0
+      ? options.maxWait : null;
+
+    let trailingTimer = null;
+    let maxWaitTimer  = null;
+    let pendingData   = undefined;
+    let pendingEvt    = undefined;
+    let hasPending    = false;
+    let leadingFired  = false;
+
+    const fire = (data, evt) => {
+      hasPending   = false;
+      leadingFired = false;
+      handler(data, evt);
+    };
+
+    const cancelTimers = () => {
+      clearTimeout(trailingTimer);
+      clearTimeout(maxWaitTimer);
+      trailingTimer = null;
+      maxWaitTimer  = null;
+    };
+
+    const wrapper = (data, evt) => {
+      pendingData = data;
+      pendingEvt  = evt;
+      hasPending  = true;
+
+      if (leading && !leadingFired) {
+        leadingFired = true;
+        fire(data, evt);
+      }
+
+      clearTimeout(trailingTimer);
+      if (trailing) {
+        trailingTimer = setTimeout(() => {
+          cancelTimers();
+          if (hasPending && !(leading && leadingFired)) {
+            fire(pendingData, pendingEvt);
+          } else {
+            hasPending   = false;
+            leadingFired = false;
+          }
+        }, delay);
+      }
+
+      // Start maxWait timer once per burst
+      if (maxWait !== null && maxWaitTimer === null) {
+        maxWaitTimer = setTimeout(() => {
+          cancelTimers();
+          if (hasPending) fire(pendingData, pendingEvt);
+        }, maxWait);
+      }
+    };
+
+    this.on(event, wrapper);
+
+    return {
+      off: () => {
+        cancelTimers();
+        this.off(event, wrapper);
+      },
+      flush: () => {
+        if (hasPending) { cancelTimers(); fire(pendingData, pendingEvt); }
+      },
+      cancel: () => {
+        cancelTimers();
+        hasPending   = false;
+        leadingFired = false;
+        pendingData  = undefined;
+        pendingEvt   = undefined;
+      },
+    };
+  }
+
+
+  // ─── throttle ───────────────────────────────────────────
+
+  /**
+   * Register a throttled handler — fires at most once per `limit` ms.
+   *
+   * leading=true  + trailing=true  → fire first + fire last  (default)
+   * leading=true  + trailing=false → fire first, drop rest
+   * leading=false + trailing=true  → fire at end of each window only
+   *
+   * @param {string}   event
+   * @param {Function} handler
+   * @param {number}   [limit=300]
+   * @param {Object}   [options]
+   * @param {boolean}  [options.leading=true]
+   * @param {boolean}  [options.trailing=true]
+   * @returns {{ off: Function, flush: Function, cancel: Function }}
+   */
+  throttle(event, handler, limit = 300, options = {}) {
+    this._validateEvent(event);
+    this._validateHandler(handler);
+
+    const leading  = options.leading  ?? true;
+    const trailing = options.trailing ?? true;
+
+    let windowTimer = null;
+    let lastCallTime = 0;
+    let pendingData  = undefined;
+    let pendingEvt   = undefined;
+    let hasPending   = false;
+
+    const fire = (data, evt) => {
+      lastCallTime = Date.now();
+      hasPending   = false;
+      handler(data, evt);
+    };
+
+    const startWindow = () => {
+      windowTimer = setTimeout(() => {
+        windowTimer  = null;
+        lastCallTime = 0;
+        if (trailing && hasPending) fire(pendingData, pendingEvt);
+      }, limit);
+    };
+
+    const wrapper = (data, evt) => {
+      pendingData = data;
+      pendingEvt  = evt;
+
+      if (!windowTimer) {
+        if (leading) {
+          fire(data, evt);
+          hasPending = false;
+        } else {
+          hasPending = true;
+        }
+        startWindow();
+      } else {
+        hasPending = true;
+      }
+    };
+
+    this.on(event, wrapper);
+
+    return {
+      off: () => {
+        clearTimeout(windowTimer);
+        windowTimer = null;
+        this.off(event, wrapper);
+      },
+      flush: () => {
+        clearTimeout(windowTimer);
+        windowTimer  = null;
+        lastCallTime = 0;
+        if (hasPending) fire(pendingData, pendingEvt);
+      },
+      cancel: () => {
+        clearTimeout(windowTimer);
+        windowTimer  = null;
+        lastCallTime = 0;
+        hasPending   = false;
+        pendingData  = undefined;
+        pendingEvt   = undefined;
+      },
+    };
+  }
+
+
+  // ─── Inspection ─────────────────────────────────────────
+
+  /** @returns {number} */
+  listenerCount(event) {
+    this._validateEvent(event);
+    return this._listeners[event]?.length ?? 0;
+  }
+
+  /** @returns {string[]} */
+  eventNames() {
+    return Object.keys(this._listeners);
+  }
+
+  /** @returns {boolean} */
+  hasListeners(event) {
+    this._validateEvent(event);
+    return (this._listeners[event]?.length ?? 0) > 0;
+  }
+
+
+  // ─── Cleanup ─────────────────────────────────────────────
+
+  /** Remove all listeners for one event, or all events. */
+  clear(event) {
+    if (event !== undefined) {
+      this._validateEvent(event);
+      delete this._listeners[event];
+    } else {
+      this._listeners = {};
+    }
+    return this;
+  }
+
+  /** Remove all listeners AND all middlewares. */
+  destroy() {
+    this._listeners   = {};
+    this._middlewares = [];
+  }
+}
+
+
+// ─── Universal export ────────────────────────────────────
+
+const _instance = new JHEventBus();
+
+if (typeof window !== "undefined")       window.JHbus = _instance;
+else if (typeof global !== "undefined")  global.JHbus = _instance;
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { JHEventBus, JHbus: _instance };
+}
+
+
+/* ─────────────────────────────────────────────────────────
+   USE CASES
+   ───────────────────────────────────────────────────────── */
+
+// 1. Basic on / emit / off
+const handler = (data, event) => console.log(`[${event}]`, data);
+JHbus.on("greet", handler);
+JHbus.emit("greet", { message: "Hello!" });
+JHbus.off("greet", handler);
+
+
+// 2. Passing and receiving data
+JHbus.on("order:placed", (data, event) => {
+  console.log(event);        // "order:placed"
+  console.log(data.orderId); // "ORD-42"
+  console.log(data.total);   // 1500
+});
+JHbus.emit("order:placed", { orderId: "ORD-42", total: 1500, items: [] });
+
+
+// 3. Async handler
+JHbus.on(
+  "invoice:generate",
+  async (data, event) => {
+    const pdf = await generatePDF(data);
+    await uploadToS3(pdf);
+  },
+  { type: "async" }
+);
+await JHbus.emit("invoice:generate", { orderId: "ORD-42" }, { mode: "sync" });
+
+
+// 4. Priority — execution order
+JHbus.on("checkout", () => console.log("3. Send email"),    { priority: 1   });
+JHbus.on("checkout", () => console.log("1. Validate stock"),{ priority: 100 });
+JHbus.on("checkout", () => console.log("2. Charge card"),   { priority: 50  });
+JHbus.emit("checkout", { cartId: "C-99" });
+// → 1 → 2 → 3
+
+
+// 5. once — auto-removes after first fire
+JHbus.once("app:boot", (config) => console.log("Booted:", config.version));
+JHbus.emit("app:boot", { version: "3.0.0" }); // fires
+JHbus.emit("app:boot", { version: "3.0.0" }); // nothing
+
+
+// 6. once — cancel early via off()
+const onboardFn = (data) => showOnboarding(data.userId);
+JHbus.once("user:firstVisit", onboardFn);
+JHbus.off("user:firstVisit", onboardFn); // cancel before it fires
+JHbus.emit("user:firstVisit", { userId: 7 }); // nothing
+
+
+// 7. Wildcard "*" — catch every event
+JHbus.on("*", (data, event) => analytics.track(event, data));
+JHbus.emit("page:view", { path: "/home" });
+JHbus.emit("btn:click", { id: "cta-buy" });
+
+
+// 8. Middleware — logging
+JHbus.use((event, data) => {
+  console.log(`[${new Date().toISOString()}] ${event}`, data);
+});
+
+
+// 9. Middleware — auth guard
+const ADMIN_EVENTS = new Set(["admin:deleteUser", "admin:exportData"]);
+JHbus.use((event) => {
+  if (ADMIN_EVENTS.has(event) && getCurrentSession()?.role !== "admin") {
+    throw new Error(`Unauthorized: "${event}"`);
+  }
+});
+
+
+// 10. Debounce — search input (fires after user stops typing)
+const searchCtrl = JHbus.debounce(
+  "search:query",
+  async (data, event) => {
+    const results = await fetch(`/api/search?q=${data.query}`).then(r => r.json());
+    renderResults(results);
+  },
+  400
+);
+JHbus.emit("search:query", { query: "s" });
+JHbus.emit("search:query", { query: "shirt" }); // only this fires, after 400ms
+searchCtrl.off(); // cleanup
+
+
+// 11. Debounce — leading edge (fire immediately, ignore re-clicks)
+JHbus.debounce(
+  "btn:submit",
+  (data) => submitOrder(data),
+  1000,
+  { leading: true, trailing: false }
+);
+JHbus.emit("btn:submit", { orderId: "ORD-99" }); // fires immediately
+JHbus.emit("btn:submit", { orderId: "ORD-99" }); // ignored
+
+
+// 12. Debounce — maxWait (guaranteed fire under constant input)
+JHbus.debounce(
+  "editor:change",
+  (data) => saveDraft(data.content),
+  300,
+  { maxWait: 1000 } // fires at least every 1s even if user keeps typing
+);
+
+
+// 13. Debounce — flush() on form submit
+const autoSaveCtrl = JHbus.debounce("form:fieldChange", (data) => saveDraft(data), 500);
+document.querySelector("#submit-btn").addEventListener("click", () => {
+  autoSaveCtrl.flush(); // process buffered input right now
+  submitForm();
+});
+
+
+// 14. Debounce — cancel() on route change
+const liveSearchCtrl = JHbus.debounce("search:query", fetchResults, 400);
+router.beforeEach(() => liveSearchCtrl.cancel());
+
+
+// 15. Throttle — scroll tracking
+const scrollCtrl = JHbus.throttle(
+  "window:scroll",
+  (data, event) => updateProgressBar(data.scrollY),
+  200
+);
+window.addEventListener("scroll", () => JHbus.emit("window:scroll", { scrollY: window.scrollY }));
+scrollCtrl.off(); // cleanup
+
+
+// 16. Throttle — leading only (fire first, drop burst)
+JHbus.throttle(
+  "btn:click",
+  (data) => logClickToAnalytics(data),
+  1000,
+  { leading: true, trailing: false }
+);
+JHbus.emit("btn:click", { id: "cta" }); // fires
+JHbus.emit("btn:click", { id: "cta" }); // dropped
+
+
+// 17. Throttle — trailing only (fire at end of window)
+JHbus.throttle(
+  "price:tick",
+  (data) => updatePriceChart(data.price),
+  500,
+  { leading: false, trailing: true }
+);
+JHbus.emit("price:tick", { price: 102.10 }); // buffered
+JHbus.emit("price:tick", { price: 101.98 }); // fires after 500ms with 101.98
+
+
+// 18. Throttle — flush() on unmount (save last position)
+const mouseMoveCtrl = JHbus.throttle("mouse:move", (data) => savePosition(data), 100);
+function cleanup() {
+  mouseMoveCtrl.flush(); // save latest position now
+  mouseMoveCtrl.off();
+}
+
+
+// 19. Throttle — cancel() to pause live updates
+const dashboardCtrl = JHbus.throttle("data:refresh", renderDashboard, 2000);
+document.querySelector("#settings-btn").addEventListener("click", () => {
+  dashboardCtrl.cancel();
+  openSettingsModal();
+});
+
+
+// 20. Component communication — no prop drilling
+JHbus.on("cart:updated", (cart) => {
+  document.querySelector("#cart-count").textContent = cart.totalItems;
+});
+function addToCart(product) {
+  const cart = cartService.add(product);
+  JHbus.emit("cart:updated", { totalItems: cart.items.length, totalPrice: cart.total });
+}
+
+
+// 21. Multi-step form — data accumulation
+const formPayload = {};
+JHbus.on("form:step1", (data) => Object.assign(formPayload, data));
+JHbus.on("form:step2", (data) => Object.assign(formPayload, data));
+JHbus.on("form:submit", async () => {
+  await fetch("/api/register", { method: "POST", body: JSON.stringify(formPayload) });
+});
+JHbus.emit("form:step1", { name: "Rahim", email: "rahim@test.com" });
+JHbus.emit("form:step2", { address: "Khulna", zip: "9100" });
+JHbus.emit("form:submit");
+
+
+// 22. Async emit — parallel (wait for all listeners)
+JHbus.on("report:build", async (data) => { await buildPDF(data);   }, { type: "async" });
+JHbus.on("report:build", async (data) => { await sendEmail(data);  }, { type: "async" });
+JHbus.on("report:build", async (data) => { await logToAudit(data); }, { type: "async" });
+await JHbus.emit("report:build", { reportId: "R-001" }); // all three run in parallel
+
+
+// 23. Async emit — sync mode (strict sequential)
+JHbus.on("payment:process", async (d) => await validateCard(d), { priority: 100, type: "async" });
+JHbus.on("payment:process", async (d) => await chargeCard(d),   { priority: 50,  type: "async" });
+JHbus.on("payment:process", async (d) => await sendReceipt(d),  { priority: 1,   type: "async" });
+await JHbus.emit("payment:process", { cardId: "card_abc", amount: 4500 }, { mode: "sync" });
+// → validate → charge → receipt
+
+
+// 24. Custom bus instance — isolated scope
+const checkoutBus = new JHEventBus({ maxListeners: 20, verbose: true });
+checkoutBus.on("step:change",  (data) => updateStepUI(data));
+checkoutBus.on("coupon:apply", (data) => recalculateTotal(data));
+
+
+// 25. Inspection / debug
+JHbus.eventNames();              // ["cart:updated", "form:step1", ...]
+JHbus.listenerCount("cart:updated"); // 1
+JHbus.hasListeners("payment:fail");  // false
+
+
+// 26. React — useEffect cleanup
+import { useEffect } from "react";
+
+function NotificationBell() {
+  useEffect(() => {
+    const handler = (data, event) => showToast(data.message);
+    JHbus.on("notification:new", handler);
+    return () => JHbus.off("notification:new", handler);
+  }, []);
+}
+
+function SearchBar() {
+  useEffect(() => {
+    const ctrl = JHbus.debounce("search:query", (data) => fetchResults(data.query), 400);
+    return () => ctrl.off();
+  }, []);
+}
+
+
+// 27. clear — one event
+JHbus.clear("window:scroll");
+
+
+// 28. clear — all events
+JHbus.clear();
+
+
+// 29. destroy — full teardown (listeners + middlewares)
+JHbus.destroy();
