@@ -1,0 +1,338 @@
+
+/**
+ * =========================================================
+ * JHEventBus v2.0 — Production Grade Event System
+ * =========================================================
+ * Features:
+ *  - on / off / once / emit
+ *  - priority-based execution
+ *  - wildcard (*) support
+ *  - middleware pipeline (runs once per emit)
+ *  - debounce (leading/trailing)
+ *  - throttle (leading/trailing)
+ *  - async + sync support
+ *  - safe execution (no crash propagation)
+ *  - debug utilities
+ * =========================================================
+ */
+
+class JHEventBus {
+  constructor(options = {}) {
+    this.listeners = {};
+    this.middlewares = [];
+    this.maxListeners = options.maxListeners || 100;
+  }
+
+  /* =========================
+   * VALIDATION
+   * ========================= */
+  _validateEvent(event) {
+    if (typeof event !== "string" || !event.trim()) {
+      throw new Error("[JHEventBus] Invalid event name");
+    }
+  }
+
+  _validateHandler(handler) {
+    if (typeof handler !== "function") {
+      throw new Error("[JHEventBus] Handler must be function");
+    }
+  }
+
+  /* =========================
+   * MIDDLEWARE
+   * ========================= */
+  use(fn) {
+    this._validateHandler(fn);
+    this.middlewares.push(fn);
+    return this;
+  }
+
+  async _runMiddlewares(event, data) {
+    for (const mw of this.middlewares) {
+      try {
+        await mw(event, data);
+      } catch (err) {
+        console.error("Middleware error:", err);
+      }
+    }
+  }
+
+  /* =========================
+   * ON
+   * ========================= */
+  on(event, handler, options = {}) {
+    this._validateEvent(event);
+    this._validateHandler(handler);
+
+    if (!this.listeners[event]) this.listeners[event] = [];
+
+    this.listeners[event].push({
+      handler,
+      priority: options.priority || 0,
+      type: options.type || "sync",
+    });
+
+    // sort by priority
+    this.listeners[event].sort((a, b) => b.priority - a.priority);
+
+    return this;
+  }
+
+  /* =========================
+   * OFF
+   * ========================= */
+  off(event, handler) {
+    this._validateEvent(event);
+    if (!this.listeners[event]) return this;
+
+    this.listeners[event] = this.listeners[event].filter(
+      (l) => l.handler !== handler
+    );
+
+    if (!this.listeners[event].length) {
+      delete this.listeners[event];
+    }
+
+    return this;
+  }
+
+  /* =========================
+   * ONCE
+   * ========================= */
+  once(event, handler) {
+    const wrapper = async (...args) => {
+      this.off(event, wrapper);
+      await handler(...args);
+    };
+
+    return this.on(event, wrapper);
+  }
+
+  /* =========================
+   * EMIT
+   * ========================= */
+  async emit(event, data = {}, options = {}) {
+    this._validateEvent(event);
+
+    const list = [...(this.listeners[event] || [])];
+    const wild = [...(this.listeners["*"] || [])];
+
+    // middleware runs ONCE per emit
+    await this._runMiddlewares(event, data);
+
+    const run = async (items) => {
+      for (const item of items) {
+        try {
+          const result = item.handler(data, event);
+
+          if (item.type === "async" || result instanceof Promise) {
+            await result;
+          }
+        } catch (err) {
+          console.error(`[JHEventBus] Error in ${event}:`, err);
+        }
+      }
+    };
+
+    if (options.mode === "sync") {
+      await run(list);
+      await run(wild);
+    } else {
+      await Promise.all([run(list), run(wild)]);
+    }
+
+    return this;
+  }
+
+  /* =========================
+   * DEBOUNCE (FIXED)
+   * =========================
+   * - supports leading / trailing
+   * - supports multiple args (safe object passing)
+   */
+  debounce(event, handler, delay = 300, opts = {}) {
+    let timer;
+    let called = false;
+
+    const leading = opts.leading || false;
+    const trailing = opts.trailing !== false;
+
+    const wrapper = (...args) => {
+      if (leading && !called) {
+        handler(...args);
+        called = true;
+      }
+
+      clearTimeout(timer);
+
+      timer = setTimeout(() => {
+        if (trailing) handler(...args);
+        called = false;
+      }, delay);
+    };
+
+    this.on(event, wrapper);
+    return () => this.off(event, wrapper);
+  }
+
+  /* =========================
+   * THROTTLE (FIXED)
+   * =========================
+   * - supports leading / trailing
+   * - supports multiple args
+   */
+  throttle(event, handler, limit = 300, opts = {}) {
+    let last = 0;
+    let timer;
+
+    const leading = opts.leading !== false;
+    const trailing = opts.trailing || false;
+
+    const wrapper = (...args) => {
+      const now = Date.now();
+
+      if (leading && now - last >= limit) {
+        last = now;
+        handler(...args);
+      }
+
+      if (trailing) {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          last = Date.now();
+          handler(...args);
+        }, limit);
+      }
+    };
+
+    this.on(event, wrapper);
+    return () => this.off(event, wrapper);
+  }
+
+  /* =========================
+   * DEBUG HELPERS
+   * ========================= */
+  listenerCount(event) {
+    return this.listeners[event]?.length || 0;
+  }
+
+  eventNames() {
+    return Object.keys(this.listeners);
+  }
+
+  clear(event) {
+    if (event) delete this.listeners[event];
+    else this.listeners = {};
+  }
+}
+
+/* =========================================================
+ * GLOBAL INSTANCE
+ * ========================================================= */
+const JHbus = new JHEventBus();
+if (typeof window !== "undefined") window.JHbus = JHbus;
+
+/* =========================================================
+ * REAL-WORLD USE CASES
+ * ========================================================= */
+
+/* -------------------------
+ * 1. MIDDLEWARE (LOGGING)
+ * ------------------------- */
+JHbus.use((event, data) => {
+  console.log("📡 EVENT:", event, data);
+});
+
+/* -------------------------
+ * 2. CART SYSTEM
+ * ------------------------- */
+JHbus.on("cart:add", (data) => {
+  console.log("🛒 MAIN PRODUCT:", data);
+});
+
+JHbus.on("cart:supplement", (data) => {
+  console.log("➕ SUPPLEMENT:", data);
+});
+
+/* -------------------------
+ * 3. WARRANTY FLOW (MODAL)
+ * ------------------------- */
+JHbus.on("modal:warranty:open", () => {
+  console.log("🛡 Warranty modal opened");
+
+  setTimeout(() => {
+    JHbus.emit("warranty:confirm", {
+      productId: 999,
+      plan: "10 years",
+      price: 49,
+    });
+  }, 1200);
+});
+
+JHbus.on("warranty:confirm", (data) => {
+  console.log("✅ WARRANTY ADDED:", data);
+});
+
+/* -------------------------
+ * 4. SEARCH (DEBOUNCE)
+ * ------------------------- */
+JHbus.debounce(
+  "search",
+  (data) => {
+    console.log("🔍 SEARCH API CALL:", data.query);
+  },
+  500
+);
+
+/* -------------------------
+ * 5. SCROLL (THROTTLE)
+ * ------------------------- */
+JHbus.throttle(
+  "scroll",
+  (data) => {
+    console.log("📜 SCROLL:", data.y);
+  },
+  1000
+);
+
+/* -------------------------
+ * 6. WILDCARD LOGGER
+ * ------------------------- */
+JHbus.on("*", (data, event) => {
+  console.log("🌍 GLOBAL EVENT:", event);
+});
+
+/* -------------------------
+ * 7. FULL FLOW SIMULATION
+ * ------------------------- */
+function simulateUserFlow() {
+  console.log("\n===== USER FLOW START =====");
+
+  // add to cart
+  JHbus.emit("cart:add", {
+    id: 101,
+    name: "T-Shirt",
+    qty: 1,
+  });
+
+  JHbus.emit("cart:supplement", {
+    id: 202,
+    name: "Subscription",
+    price: 59,
+  });
+
+  // open warranty modal
+  JHbus.emit("modal:warranty:open");
+
+  // search typing
+  JHbus.emit("search", { query: "iphone" });
+  JHbus.emit("search", { query: "iphone 15 pro" });
+
+  // scroll tracking
+  JHbus.emit("scroll", { y: 100 });
+  JHbus.emit("scroll", { y: 400 });
+
+  console.log("===== USER FLOW END =====\n");
+}
+
+simulateUserFlow();
